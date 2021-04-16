@@ -63,7 +63,12 @@ namespace BTCPayServer.Tests
             }
             options.AddArguments($"window-size={windowSize.Width}x{windowSize.Height}");
             options.AddArgument("shm-size=2g");
-            Driver = new ChromeDriver(chromeDriverPath, options, 
+
+            var cds = ChromeDriverService.CreateDefaultService(chromeDriverPath);
+            cds.Port = Utils.FreeTcpPort();
+            cds.HostName = "127.0.0.1";
+            cds.Start();
+            Driver = new ChromeDriver(cds, options, 
                 // A bit less than test timeout
                 TimeSpan.FromSeconds(50));
 
@@ -225,7 +230,7 @@ namespace BTCPayServer.Tests
 
         public void ClickOnAllSideMenus()
         {
-            var links = Driver.FindElements(By.CssSelector(".nav-pills .nav-link")).Select(c => c.GetAttribute("href")).ToList();
+            var links = Driver.FindElements(By.CssSelector(".nav .nav-link")).Select(c => c.GetAttribute("href")).ToList();
             Driver.AssertNoError();
             Assert.NotEmpty(links);
             foreach (var l in links)

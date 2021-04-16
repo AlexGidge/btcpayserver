@@ -104,7 +104,7 @@ namespace BTCPayServer.Payments.Lightning
         }
         private Task<List<ListenedInvoice>> GetListenedInvoices(string invoiceId)
         {
-            return _memoryCache.GetOrCreateAsync(invoiceId, async (cacheEntry) =>
+            return _memoryCache.GetOrCreateAsync($"{nameof(GetListenedInvoices)}-{invoiceId}", async (cacheEntry) =>
             {
                 var listenedInvoices = new List<ListenedInvoice>();
                 var invoice = await _InvoiceRepository.GetInvoice(invoiceId);
@@ -112,7 +112,7 @@ namespace BTCPayServer.Payments.Lightning
                                                               .Where(c => c.GetId().PaymentType == PaymentTypes.LightningLike))
                 {
                     var lightningMethod = paymentMethod.GetPaymentMethodDetails() as LightningLikePaymentMethodDetails;
-                    if (lightningMethod == null)
+                    if (lightningMethod == null || !lightningMethod.Activated)
                         continue;
                     var lightningSupportedMethod = invoice.GetSupportedPaymentMethod<LightningSupportedPaymentMethod>()
                                               .FirstOrDefault(c => c.CryptoCode == paymentMethod.GetId().CryptoCode);

@@ -8,7 +8,6 @@ using BTCPayServer.Abstractions.Constants;
 using BTCPayServer.Abstractions.Extensions;
 using BTCPayServer.Abstractions.Models;
 using BTCPayServer.Client;
-using BTCPayServer.Client.Models;
 using BTCPayServer.Data;
 using BTCPayServer.HostedServices;
 using BTCPayServer.ModelBinders;
@@ -16,7 +15,6 @@ using BTCPayServer.Models;
 using BTCPayServer.Models.StoreViewModels;
 using BTCPayServer.Models.WalletViewModels;
 using BTCPayServer.Payments;
-using BTCPayServer.Security;
 using BTCPayServer.Services;
 using BTCPayServer.Services.Labels;
 using BTCPayServer.Services.Rates;
@@ -27,6 +25,7 @@ using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
 using NBitcoin;
 using BTCPayServer.BIP78.Sender;
+using BTCPayServer.Payments.PayJoin;
 using NBitcoin.DataEncoders;
 using NBXplorer;
 using NBXplorer.DerivationStrategy;
@@ -61,6 +60,7 @@ namespace BTCPayServer.Controllers
         private readonly ApplicationDbContextFactory _dbContextFactory;
         private readonly BTCPayNetworkJsonSerializerSettings _jsonSerializerSettings;
         private readonly PullPaymentHostedService _pullPaymentService;
+        private readonly IEnumerable<IPayoutHandler> _payoutHandlers;
 
         public RateFetcher RateFetcher { get; }
 
@@ -85,7 +85,8 @@ namespace BTCPayServer.Controllers
                                  LabelFactory labelFactory,
                                  ApplicationDbContextFactory dbContextFactory,
                                  BTCPayNetworkJsonSerializerSettings jsonSerializerSettings,
-                                 HostedServices.PullPaymentHostedService pullPaymentService)
+                                 HostedServices.PullPaymentHostedService pullPaymentService,
+                                 IEnumerable<IPayoutHandler> payoutHandlers)
         {
             _currencyTable = currencyTable;
             Repository = repo;
@@ -108,6 +109,7 @@ namespace BTCPayServer.Controllers
             _dbContextFactory = dbContextFactory;
             _jsonSerializerSettings = jsonSerializerSettings;
             _pullPaymentService = pullPaymentService;
+            _payoutHandlers = payoutHandlers;
         }
 
         // Borrowed from https://github.com/ManageIQ/guides/blob/master/labels.md
@@ -341,6 +343,8 @@ namespace BTCPayServer.Controllers
                 model.Transactions = model.Transactions.OrderByDescending(t => t.Timestamp).Skip(skip).Take(count).ToList();
             }
 
+            model.CryptoCode = walletId.CryptoCode;
+
             return View(model);
         }
 
@@ -362,13 +366,20 @@ namespace BTCPayServer.Controllers
             var network = NetworkProvider.GetNetwork<BTCPayNetwork>(walletId?.CryptoCode);
             if (network == null)
                 return NotFound();
-
             var address = _walletReceiveService.Get(walletId)?.Address;
+            var allowedPayjoin = paymentMethod.IsHotWallet && CurrentStore.GetStoreBlob().PayJoinEnabled;
+            var bip21 = address is null ? null : network.GenerateBIP21(address.ToString(), null);
+            if (allowedPayjoin)
+            {
+                bip21 +=
+                    $"?{PayjoinClient.BIP21EndpointKey}={Request.GetAbsoluteUri(Url.Action(nameof(PayJoinEndpointController.Submit), "PayJoinEndpoint", new {walletId.CryptoCode}))}";
+            }
             return View(new WalletReceiveViewModel()
             {
                 CryptoCode = walletId.CryptoCode,
                 Address = address?.ToString(),
-                CryptoImage = GetImage(paymentMethod.PaymentId, network)
+                CryptoImage = GetImage(paymentMethod.PaymentId, network),
+                PaymentLink = bip21
             });
         }
 
@@ -416,7 +427,7 @@ namespace BTCPayServer.Controllers
         [Route("{walletId}/send")]
         public async Task<IActionResult> WalletSend(
             [ModelBinder(typeof(WalletIdModelBinder))]
-            WalletId walletId, string defaultDestination = null, string defaultAmount = null, string bip21 = null)
+            WalletId walletId, string defaultDestination = null, string defaultAmount = null, string[] bip21 = null)
         {
             if (walletId?.StoreId == null)
                 return NotFound();
@@ -434,19 +445,29 @@ namespace BTCPayServer.Controllers
             double.TryParse(defaultAmount, out var amount);
             var model = new WalletSendModel()
             {
-                Outputs = new List<WalletSendModel.TransactionOutput>()
+                CryptoCode = walletId.CryptoCode
+            };
+            if (bip21?.Any() is true)
+            {
+                foreach (var link in bip21)
+                {
+                    if (!string.IsNullOrEmpty(link))
+                    {
+                        
+                        LoadFromBIP21(model, link, network);
+                    }
+                }
+            }
+
+            if (!(model.Outputs?.Any() is true))
+            {
+                model.Outputs = new List<WalletSendModel.TransactionOutput>()
                 {
                     new WalletSendModel.TransactionOutput()
                     {
-                        Amount = Convert.ToDecimal(amount),
-                        DestinationAddress = defaultDestination
+                        Amount = Convert.ToDecimal(amount), DestinationAddress = defaultDestination
                     }
-                },
-                CryptoCode = walletId.CryptoCode
-            };
-            if (!string.IsNullOrEmpty(bip21))
-            {
-                LoadFromBIP21(model, bip21, network);
+                };
             }
             var feeProvider = _feeRateProvider.CreateFeeProvider(network);
             var recommendedFees =
@@ -470,7 +491,7 @@ namespace BTCPayServer.Controllers
                     .ToArray();
             var balance = _walletProvider.GetWallet(network).GetBalance(paymentMethod.AccountDerivation);
             model.NBXSeedAvailable = await GetSeed(walletId, network) != null;
-            model.CurrentBalance = await balance;
+            model.CurrentBalance = (await balance).Total.GetValue(network);
 
             await Task.WhenAll(recommendedFees);
             model.RecommendedSatoshiPerByte =
@@ -530,6 +551,7 @@ namespace BTCPayServer.Controllers
             vm.NBXSeedAvailable = await GetSeed(walletId, network) != null;
             if (!string.IsNullOrEmpty(bip21))
             {
+                vm.Outputs?.Clear();
                 LoadFromBIP21(vm, bip21, network);
             }
 
@@ -567,6 +589,10 @@ namespace BTCPayServer.Controllers
 
             if (!string.IsNullOrEmpty(bip21))
             {
+                if (!vm.Outputs.Any())
+                {
+                    vm.Outputs.Add(new WalletSendModel.TransactionOutput());
+                }
                 return View(vm);
             }
             if (command == "add-output")
@@ -710,6 +736,7 @@ namespace BTCPayServer.Controllers
 
         private void LoadFromBIP21(WalletSendModel vm, string bip21, BTCPayNetwork network)
         {
+            vm.Outputs ??= new List<WalletSendModel.TransactionOutput>();
             try
             {
                 if (bip21.StartsWith(network.UriScheme, StringComparison.InvariantCultureIgnoreCase))
@@ -718,15 +745,13 @@ namespace BTCPayServer.Controllers
                 }
 
                 var uriBuilder = new NBitcoin.Payment.BitcoinUrlBuilder(bip21, network.NBitcoinNetwork);
-                vm.Outputs = new List<WalletSendModel.TransactionOutput>()
+
+                vm.Outputs.Add(new WalletSendModel.TransactionOutput()
                 {
-                    new WalletSendModel.TransactionOutput()
-                    {
-                        Amount = uriBuilder.Amount.ToDecimal(MoneyUnit.BTC),
-                        DestinationAddress = uriBuilder.Address.ToString(),
-                        SubtractFeesFromOutput = false
-                    }
-                };
+                    Amount = uriBuilder.Amount?.ToDecimal(MoneyUnit.BTC),
+                    DestinationAddress = uriBuilder.Address.ToString(),
+                    SubtractFeesFromOutput = false
+                });
                 if (!string.IsNullOrEmpty(uriBuilder.Label) || !string.IsNullOrEmpty(uriBuilder.Message))
                 {
                     TempData.SetStatusMessageModel(new StatusMessageModel()
@@ -744,13 +769,11 @@ namespace BTCPayServer.Controllers
             {
                 try
                 {
-                    vm.Outputs = new List<WalletSendModel.TransactionOutput>()
-                    {
-                        new WalletSendModel.TransactionOutput()
+                    vm.Outputs.Add(new WalletSendModel.TransactionOutput()
                         {
                             DestinationAddress = BitcoinAddress.Create(bip21, network.NBitcoinNetwork).ToString()
                         }
-                    };
+                    );
                 }
                 catch
                 {
@@ -1029,17 +1052,14 @@ namespace BTCPayServer.Controllers
 
         private static async Task<string> GetBalanceString(BTCPayWallet wallet, DerivationStrategyBase derivationStrategy)
         {
-            using (CancellationTokenSource cts = new CancellationTokenSource(TimeSpan.FromSeconds(10)))
+            using CancellationTokenSource cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            try
             {
-                try
-                {
-                    return (await wallet.GetBalance(derivationStrategy, cts.Token)).ShowMoney(wallet.Network
-                        .Divisibility);
-                }
-                catch
-                {
-                    return "--";
-                }
+                return (await wallet.GetBalance(derivationStrategy, cts.Token)).Total.ShowMoney(wallet.Network);
+            }
+            catch
+            {
+                return "--";
             }
         }
 
@@ -1180,6 +1200,7 @@ namespace BTCPayServer.Controllers
         public string CryptoImage { get; set; }
         public string CryptoCode { get; set; }
         public string Address { get; set; }
+        public string PaymentLink { get; set; }
     }
 
 

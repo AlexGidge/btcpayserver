@@ -19,6 +19,7 @@ using BTCPayServer.Payments.Bitcoin;
 using BTCPayServer.Payments.Lightning;
 using BTCPayServer.Payments.PayJoin;
 using BTCPayServer.Plugins;
+using BTCPayServer.Plugins.Shopify;
 using BTCPayServer.Security;
 using BTCPayServer.Security.Bitpay;
 using BTCPayServer.Security.GreenField;
@@ -32,7 +33,6 @@ using BTCPayServer.Services.Notifications;
 using BTCPayServer.Services.Notifications.Blobs;
 using BTCPayServer.Services.PaymentRequests;
 using BTCPayServer.Services.Rates;
-using BTCPayServer.Services.Shopify;
 using BTCPayServer.Services.Stores;
 using BTCPayServer.Services.Wallets;
 using BTCPayServer.U2F;
@@ -83,7 +83,6 @@ namespace BTCPayServer.Hosting
             });
 
             services.AddSingleton<BTCPayNetworkJsonSerializerSettings>();
-            services.RegisterJsonConverter(n => new ClaimDestinationJsonConverter(n));
 
             services.AddPayJoinServices();
 #if ALTCOINS
@@ -318,6 +317,8 @@ namespace BTCPayServer.Hosting
                 .ConfigureHttpClient(h => h.DefaultRequestHeaders.ConnectionClose = true)
                 .ConfigurePrimaryHttpMessageHandler<Socks5HttpClientHandler>();
             
+
+            services.AddSingleton<IPayoutHandler, BitcoinLikePayoutHandler>();
             services.AddSingleton<HostedServices.PullPaymentHostedService>();
             services.AddSingleton<IHostedService, HostedServices.PullPaymentHostedService>(o => o.GetRequiredService<PullPaymentHostedService>());
 
@@ -359,8 +360,6 @@ namespace BTCPayServer.Hosting
             services.AddSingleton<INotificationHandler, PayoutNotification.Handler>();
 
             services.AddSingleton<IHostedService, DbMigrationsHostedService>();
-
-            services.AddShopify();
 #if DEBUG
             services.AddSingleton<INotificationHandler, JunkNotification.Handler>();
 #endif    

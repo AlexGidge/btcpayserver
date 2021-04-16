@@ -11,6 +11,7 @@ using BTCPayServer.Client.Models;
 using BTCPayServer.Data;
 using BTCPayServer.HostedServices;
 using BTCPayServer.Models.WalletViewModels;
+using BTCPayServer.Payments.PayJoin;
 using BTCPayServer.Payments.PayJoin.Sender;
 using BTCPayServer.Services;
 using BTCPayServer.Services.Wallets;
@@ -44,6 +45,7 @@ namespace BTCPayServer.Controllers.GreenField
         private readonly DelayedTransactionBroadcaster _delayedTransactionBroadcaster;
         private readonly EventAggregator _eventAggregator;
         private readonly WalletReceiveService _walletReceiveService;
+        private readonly IFeeProviderFactory _feeProviderFactory;
 
         public StoreOnChainWalletsController(
             IAuthorizationService authorizationService,
@@ -57,7 +59,8 @@ namespace BTCPayServer.Controllers.GreenField
             PayjoinClient payjoinClient,
             DelayedTransactionBroadcaster delayedTransactionBroadcaster,
             EventAggregator eventAggregator, 
-            WalletReceiveService walletReceiveService)
+            WalletReceiveService walletReceiveService,
+            IFeeProviderFactory feeProviderFactory)
         {
             _authorizationService = authorizationService;
             _btcPayWalletProvider = btcPayWalletProvider;
@@ -71,6 +74,7 @@ namespace BTCPayServer.Controllers.GreenField
             _delayedTransactionBroadcaster = delayedTransactionBroadcaster;
             _eventAggregator = eventAggregator;
             _walletReceiveService = walletReceiveService;
+            _feeProviderFactory = feeProviderFactory;
         }
 
         [Authorize(Policy = Policies.CanModifyStoreSettings, AuthenticationSchemes = AuthenticationSchemes.Greenfield)]
@@ -81,9 +85,29 @@ namespace BTCPayServer.Controllers.GreenField
                 out DerivationSchemeSettings derivationScheme, out IActionResult actionResult)) return actionResult;
 
             var wallet = _btcPayWalletProvider.GetWallet(network);
+            var balance = await wallet.GetBalance(derivationScheme.AccountDerivation);
+            
             return Ok(new OnChainWalletOverviewData()
             {
-                Balance = await wallet.GetBalance(derivationScheme.AccountDerivation)
+                Label = derivationScheme.ToPrettyString(),
+                Balance = balance.Total.GetValue(network),
+                UnconfirmedBalance= balance.Unconfirmed.GetValue(network),
+                ConfirmedBalance= balance.Confirmed.GetValue(network),
+            });
+        }
+        
+        [Authorize(Policy = Policies.CanModifyStoreSettings, AuthenticationSchemes = AuthenticationSchemes.Greenfield)]
+        [HttpGet("~/api/v1/stores/{storeId}/payment-methods/onchain/{cryptoCode}/wallet/feerate")]
+        public async Task<IActionResult> GetOnChainFeeRate(string storeId, string cryptoCode, int? blockTarget = null)
+        {
+            if (IsInvalidWalletRequest(cryptoCode, out BTCPayNetwork network,
+                out DerivationSchemeSettings derivationScheme, out IActionResult actionResult)) return actionResult;
+
+            var feeRateTarget = blockTarget?? Store.GetStoreBlob().RecommendedFeeBlockTarget;
+            return Ok(new OnChainWalletFeeRateData()
+            {
+                FeeRate =  await _feeProviderFactory.CreateFeeProvider(network)
+                    .GetFeeRateAsync(feeRateTarget),
             });
         }
         
@@ -99,9 +123,18 @@ namespace BTCPayServer.Controllers.GreenField
             {
                 return BadRequest();
             }
+
+            var bip21 = network.GenerateBIP21(kpi.Address.ToString(), null);
+            var allowedPayjoin = derivationScheme.IsHotWallet && Store.GetStoreBlob().PayJoinEnabled;
+            if (allowedPayjoin)
+            {
+               bip21 +=
+                   $"?{PayjoinClient.BIP21EndpointKey}={Request.GetAbsoluteUri(Url.Action(nameof(PayJoinEndpointController.Submit), "PayJoinEndpoint", new {cryptoCode}))}";
+            }
             return Ok(new OnChainWalletAddressData()
             {
                 Address = kpi.Address.ToString(),
+                PaymentLink =  bip21,
                 KeyPath = kpi.KeyPath
             });
         }
@@ -131,7 +164,6 @@ namespace BTCPayServer.Controllers.GreenField
 
             var wallet = _btcPayWalletProvider.GetWallet(network);
             var walletId = new WalletId(storeId, cryptoCode);
-            var walletBlobAsync = await _walletRepository.GetWalletInfo(walletId);
             var walletTransactionsInfoAsync = await _walletRepository.GetWalletTransactionsInfo(walletId);
 
             var txs = await wallet.FetchTransactions(derivationScheme.AccountDerivation);
@@ -204,7 +236,10 @@ namespace BTCPayServer.Controllers.GreenField
                         Comment = info?.Comment,
                         Labels = info?.Labels,
                         Link = string.Format(CultureInfo.InvariantCulture, network.BlockExplorerLink,
-                            coin.OutPoint.Hash.ToString())
+                            coin.OutPoint.Hash.ToString()),
+                        Timestamp = coin.Timestamp,
+                        KeyPath = coin.KeyPath,
+                        Address = network.NBXplorerNetwork.CreateAddress(derivationScheme.AccountDerivation, coin.KeyPath,  coin.ScriptPubKey).ToString()
                     };
                 }).ToList()
             );
@@ -298,7 +333,7 @@ namespace BTCPayServer.Controllers.GreenField
                     request.AddModelError(transactionRequest => transactionRequest.Destinations[index],
                         "Amount must be specified or destination must be a BIP21 payment link, and greater than 0", this);
                 }
-                if (request.ProceedWithPayjoin && bip21?.UnknowParameters?.ContainsKey("pj") is true)
+                if (request.ProceedWithPayjoin && bip21?.UnknowParameters?.ContainsKey(PayjoinClient.BIP21EndpointKey) is true)
                 {
                     payjoinOutputIndex = index;
                 }
@@ -332,7 +367,7 @@ namespace BTCPayServer.Controllers.GreenField
                     "You are sending your entire balance, you should subtract the fees from a destination", this);
             }
 
-            var minRelayFee = this._nbXplorerDashboard.Get(network.CryptoCode).Status.BitcoinStatus?.MinRelayTxFee ??
+            var minRelayFee = _nbXplorerDashboard.Get(network.CryptoCode).Status.BitcoinStatus?.MinRelayTxFee ??
                               new FeeRate(1.0m);
             if (request.FeeRate != null && request.FeeRate < minRelayFee)
             {
